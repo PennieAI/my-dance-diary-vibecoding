@@ -267,6 +267,7 @@ export function DanceCalendar() {
   const [backupNotice, setBackupNotice] = useState<BackupNotice | null>(null);
   const [monthWindowOffset, setMonthWindowOffset] = useState(0);
   const importInputRef = useRef<HTMLInputElement>(null);
+  const backupPanelRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     let safeStart = DEFAULT_START;
@@ -312,6 +313,14 @@ export function DanceCalendar() {
     };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
   }, [startDate, endDate, checkins, ratings, loaded]);
+
+  useEffect(() => {
+    if (!showBackup) return;
+    const frame = window.requestAnimationFrame(() => {
+      backupPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [showBackup]);
 
   const filteredCheckins = useMemo(
     () => {
@@ -722,10 +731,16 @@ export function DanceCalendar() {
         <div className="topbar-meta">
           <span className="era-label">{startDate.slice(0, 4)}—{endDate.slice(0, 4)} · DANCE DIARY</span>
           <div className="topbar-actions">
-            <button className="text-button" type="button" onClick={() => {
+            <button
+              className="text-button"
+              type="button"
+              aria-expanded={showBackup}
+              aria-controls="data-backup-panel"
+              onClick={() => {
               setShowBackup((value) => !value);
               setShowSettings(false);
-            }}>
+              }}
+            >
               {showBackup ? "收起备份" : "数据备份"}
             </button>
             <button className="text-button" type="button" onClick={() => {
@@ -836,7 +851,12 @@ export function DanceCalendar() {
       )}
 
       {showBackup && (
-        <section className="settings-panel backup-panel" aria-label="数据备份">
+        <section
+          ref={backupPanelRef}
+          id="data-backup-panel"
+          className="settings-panel backup-panel"
+          aria-label="数据备份"
+        >
           <div>
             <p className="section-kicker">DATA BACKUP</p>
             <h2>带走你的练舞日记</h2>

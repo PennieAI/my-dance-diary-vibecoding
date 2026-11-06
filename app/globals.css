@@ -839,6 +839,7 @@ footer {
 
 .backup-panel {
   align-items: flex-start;
+  scroll-margin-top: 24px;
 }
 
 .backup-controls {

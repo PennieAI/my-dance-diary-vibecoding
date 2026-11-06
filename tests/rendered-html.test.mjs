@@ -55,6 +55,10 @@ test("keeps configuration separate from product logic", async () => {
   assert.match(calendar, /danceIndex/);
   assert.match(calendar, /exportBackup/);
   assert.match(calendar, /importBackup/);
+  assert.match(calendar, /backupPanelRef/);
+  assert.match(calendar, /scrollIntoView\(\{ behavior: "smooth", block: "start" \}\)/);
+  assert.match(calendar, /aria-controls="data-backup-panel"/);
+  assert.match(calendar, /aria-expanded=\{showBackup\}/);
   assert.match(calendar, /导出数据/);
   assert.match(calendar, /导入数据/);
   assert.match(calendar, /近月节奏/);
