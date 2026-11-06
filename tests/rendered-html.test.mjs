@@ -22,12 +22,15 @@ test("server-renders the anonymized dance diary", async () => {
   const html = await response.text();
   assert.match(html, /MY DANCE DIARY/);
   assert.match(html, /120/);
-  assert.match(html, /匿名示例课表/);
+  assert.match(html, /数据备份/);
   assert.match(html, /月视图/);
   assert.match(html, /周视图/);
   assert.match(html, /平均舞力指数/);
   assert.match(html, /当前单节课价/);
-  assert.doesNotMatch(html, /真实课表|真实老师|真实金额/);
+  assert.match(html, /已使用卡期/);
+  assert.match(html, /课次进度/);
+  assert.match(html, /时间进度/);
+  assert.doesNotMatch(html, /真实课表|真实老师|真实金额|Pennie|PENNIE|10728|小玥|小羽|萝卜/);
 });
 
 test("keeps configuration separate from product logic", async () => {
@@ -40,6 +43,8 @@ test("keeps configuration separate from product logic", async () => {
 
   assert.match(config, /const ANNUAL_SPEND = 3600/);
   assert.match(config, /const TARGET_COUNT = 120/);
+  assert.match(config, /const MONTHLY_TARGET = 10/);
+  assert.match(config, /const BACKUP_APP_ID = "my-dance-diary"/);
   assert.match(config, /my-dance-diary-demo-v1/);
   assert.match(config, /老师 A/);
   assert.match(config, /Demo values only/);
@@ -48,7 +53,15 @@ test("keeps configuration separate from product logic", async () => {
   assert.match(calendar, /calendar-view-switch/);
   assert.match(calendar, /week-head-metrics/);
   assert.match(calendar, /danceIndex/);
+  assert.match(calendar, /exportBackup/);
+  assert.match(calendar, /importBackup/);
+  assert.match(calendar, /导出数据/);
+  assert.match(calendar, /导入数据/);
+  assert.match(calendar, /近月节奏/);
+  assert.match(calendar, /remainingPassDays/);
+  assert.match(calendar, /visibleLinkedMonthStats/);
   assert.match(calendar, /window\.localStorage/);
+  assert.doesNotMatch(calendar, /Pennie|PENNIE|10728|小玥|小羽|萝卜/);
   assert.match(layout, /Vibe Coding 练舞打卡/);
   assert.doesNotMatch(layout, /chatgpt\.site/);
   assert.match(packageJson, /my-dance-diary-vibecoding/);

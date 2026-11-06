@@ -1,10 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ANNUAL_SPEND,
+  BACKUP_APP_ID,
   DEFAULT_END,
   DEFAULT_START,
+  MONTHLY_TARGET,
   SCHEDULE,
   STORAGE_KEY,
   TARGET_COUNT,
@@ -18,6 +20,18 @@ type SavedState = {
   endDate: string;
   checkins: string[];
   ratings?: Record<string, number>;
+};
+
+type BackupFile = {
+  app: string;
+  version: 1;
+  exportedAt: string;
+  data: SavedState;
+};
+
+type BackupNotice = {
+  tone: "success" | "error";
+  text: string;
 };
 
 const CHINA_TIME_ZONE = "Asia/Shanghai";
@@ -58,6 +72,10 @@ const DIFFICULTY_VALUE: Record<Difficulty, number> = {
 const COURSE_BY_ID = Object.fromEntries(
   Object.values(SCHEDULE).flat().map((course) => [course.id, course]),
 );
+
+function scheduleForDate(key: string) {
+  return SCHEDULE[dateFromKey(key).getDay()] || [];
+}
 
 function danceIndex(course: Course, rating: number) {
   return DIFFICULTY_VALUE[course.level] * rating;
@@ -123,6 +141,10 @@ function inclusiveDays(start: string, end: string) {
   return Math.max(1, Math.floor((endTime - startTime) / 86400000) + 1);
 }
 
+function migrateDefaultEnd(value?: string) {
+  return value || DEFAULT_END;
+}
+
 function monthCells(year: number, month: number) {
   const first = new Date(year, month, 1);
   const sundayOffset = first.getDay();
@@ -157,19 +179,95 @@ function clampDateKey(key: string, start: string, end: string) {
   return key;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isValidDateKey(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  return dateKey(dateFromKey(value)) === value;
+}
+
+function parseBackup(value: unknown): SavedState {
+  if (isRecord(value) && "data" in value) {
+    if (value.version !== 1 || !isRecord(value.data)) {
+      throw new Error("该文件不是兼容的 My Dance Diary 备份。");
+    }
+  }
+  const source = isRecord(value) && isRecord(value.data) ? value.data : value;
+  if (!isRecord(source)) throw new Error("文件内容不是有效的练舞日记备份。");
+
+  const { startDate, endDate, checkins, ratings } = source;
+  if (!isValidDateKey(startDate) || !isValidDateKey(endDate) || startDate > endDate) {
+    throw new Error("备份中的年卡日期无效。");
+  }
+  if (!Array.isArray(checkins) || checkins.length > 5000 || !checkins.every((entry) => typeof entry === "string")) {
+    throw new Error("备份中的打卡记录无效。");
+  }
+  if (ratings !== undefined && !isRecord(ratings)) {
+    throw new Error("备份中的评分记录无效。");
+  }
+
+  const cleanCheckins = Array.from(new Set(checkins.filter(
+    (entry) => /^\d{4}-\d{2}-\d{2}::[^:]+$/.test(entry) && isValidDateKey(entry.slice(0, 10)),
+  )));
+  if (cleanCheckins.length !== checkins.length) {
+    throw new Error("备份中包含无法识别的打卡记录。");
+  }
+  const checkinSet = new Set(cleanCheckins);
+  const cleanRatings = Object.fromEntries(
+    Object.entries(ratings || {}).filter(
+      ([entry, score]) => checkinSet.has(entry) && Number.isInteger(score) && Number(score) >= 1 && Number(score) <= 5,
+    ),
+  );
+
+  return {
+    startDate,
+    endDate: migrateDefaultEnd(endDate),
+    checkins: cleanCheckins,
+    ratings: cleanRatings,
+  };
+}
+
+function danceCategory(style: string) {
+  const normalized = style.toUpperCase();
+  if (normalized.includes("HIPHOP") && normalized.includes("SWAG")) return "HIPHOP/SWAG";
+  if (normalized.includes("CHOREO")) return "CHOREO";
+  if (normalized.includes("HIPHOP")) return "HIPHOP";
+  if (normalized.includes("SWAG")) return "SWAG";
+  if (normalized.includes("KPOP")) return "KPOP";
+  if (normalized.includes("JAZZ")) return "JAZZ";
+  return style;
+}
+
+function monthKeysBetween(start: string, end: string) {
+  const cursor = dateFromKey(`${start.slice(0, 7)}-01`);
+  const last = dateFromKey(`${end.slice(0, 7)}-01`);
+  const keys: string[] = [];
+  while (cursor <= last) {
+    keys.push(`${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, "0")}`);
+    cursor.setMonth(cursor.getMonth() + 1);
+  }
+  return keys;
+}
+
 export function DanceCalendar() {
   const [startDate, setStartDate] = useState(DEFAULT_START);
   const [endDate, setEndDate] = useState(DEFAULT_END);
   const [selectedDate, setSelectedDate] = useState(DEFAULT_START);
   const [viewMonth, setViewMonth] = useState(monthIndex(DEFAULT_START));
   const [calendarView, setCalendarView] = useState<CalendarView>("month");
+  const [selectedStyle, setSelectedStyle] = useState<string | null>(null);
   const [checkins, setCheckins] = useState<Set<string>>(new Set());
   const [ratings, setRatings] = useState<Record<string, number>>({});
   const [ratingCourseId, setRatingCourseId] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showBackup, setShowBackup] = useState(false);
+  const [backupNotice, setBackupNotice] = useState<BackupNotice | null>(null);
+  const [monthWindowOffset, setMonthWindowOffset] = useState(0);
+  const importInputRef = useRef<HTMLInputElement>(null);
 
-  /* eslint-disable react-hooks/set-state-in-effect -- hydrate the device-local diary once on mount */
   useEffect(() => {
     let safeStart = DEFAULT_START;
     let safeEnd = DEFAULT_END;
@@ -178,7 +276,7 @@ export function DanceCalendar() {
       if (raw) {
         const saved = JSON.parse(raw) as SavedState;
         safeStart = saved.startDate || DEFAULT_START;
-        safeEnd = saved.endDate || DEFAULT_END;
+        safeEnd = migrateDefaultEnd(saved.endDate);
         setStartDate(safeStart);
         setEndDate(safeEnd);
         setCheckins(new Set(saved.checkins || []));
@@ -203,7 +301,6 @@ export function DanceCalendar() {
       setLoaded(true);
     }
   }, []);
-  /* eslint-enable react-hooks/set-state-in-effect */
 
   useEffect(() => {
     if (!loaded) return;
@@ -232,6 +329,25 @@ export function DanceCalendar() {
     [checkins, startDate, endDate],
   );
   const effectiveCheckins = useMemo(() => new Set(filteredCheckins), [filteredCheckins]);
+  const historicalCoursesByDate = useMemo(() => {
+    const grouped = new Map<string, Course[]>();
+    checkins.forEach((entry) => {
+      const [key, courseId] = entry.split("::");
+      const course = COURSE_BY_ID[courseId];
+      if (!course) return;
+      grouped.set(key, [...(grouped.get(key) || []), course]);
+    });
+    return grouped;
+  }, [checkins]);
+
+  function coursesForDate(key: string) {
+    const scheduled = scheduleForDate(key);
+    const scheduledIds = new Set(scheduled.map((course) => course.id));
+    const historical = (historicalCoursesByDate.get(key) || []).filter(
+      (course) => !scheduledIds.has(course.id),
+    );
+    return [...scheduled, ...historical];
+  }
 
   const checkinCount = filteredCheckins.length;
   const filteredRatings = filteredCheckins
@@ -253,27 +369,177 @@ export function DanceCalendar() {
     danceIndices.length > 0
       ? danceIndices.reduce((sum, value) => sum + value, 0) / danceIndices.length
       : null;
+  const analyticsRecords = useMemo(
+    () => filteredCheckins.flatMap((entry) => {
+      const [date, courseId] = entry.split("::");
+      const course = COURSE_BY_ID[courseId];
+      if (!course) return [];
+      const rating = ratings[entry];
+      return [{
+        date,
+        course,
+        rating: typeof rating === "number" ? rating : null,
+        power: typeof rating === "number" ? danceIndex(course, rating) : null,
+      }];
+    }),
+    [filteredCheckins, ratings],
+  );
+  const styleStats = useMemo(() => {
+    const groups = new Map<string, {
+      name: string;
+      count: number;
+      ratingTotal: number;
+      ratingCount: number;
+      powerTotal: number;
+      powerCount: number;
+    }>();
+    analyticsRecords.forEach((record) => {
+      const name = danceCategory(record.course.style);
+      const current = groups.get(name) || {
+        name,
+        count: 0,
+        ratingTotal: 0,
+        ratingCount: 0,
+        powerTotal: 0,
+        powerCount: 0,
+      };
+      current.count += 1;
+      if (record.rating !== null) {
+        current.ratingTotal += record.rating;
+        current.ratingCount += 1;
+      }
+      if (record.power !== null) {
+        current.powerTotal += record.power;
+        current.powerCount += 1;
+      }
+      groups.set(name, current);
+    });
+    return Array.from(groups.values())
+      .map((group) => ({
+        name: group.name,
+        count: group.count,
+        averageRating: group.ratingCount > 0 ? group.ratingTotal / group.ratingCount : null,
+        averagePower: group.powerCount > 0 ? group.powerTotal / group.powerCount : null,
+      }))
+      .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name));
+  }, [analyticsRecords]);
+  const monthStats = useMemo(() => {
+    const groups = new Map(monthKeysBetween(startDate, endDate).map((key) => [key, {
+      key,
+      count: 0,
+      ratingTotal: 0,
+      ratingCount: 0,
+    }]));
+    filteredCheckins.forEach((entry) => {
+      const key = entry.slice(0, 7);
+      const current = groups.get(key);
+      if (!current) return;
+      current.count += 1;
+      const rating = ratings[entry];
+      if (typeof rating === "number") {
+        current.ratingTotal += rating;
+        current.ratingCount += 1;
+      }
+    });
+    return Array.from(groups.values()).map((group) => ({
+      key: group.key,
+      label: `${Number(group.key.slice(5, 7))}月`,
+      year: group.key.slice(0, 4),
+      count: group.count,
+      averageRating: group.ratingCount > 0 ? group.ratingTotal / group.ratingCount : null,
+    }));
+  }, [filteredCheckins, ratings, startDate, endDate]);
+  const linkedStyle = selectedStyle && styleStats.some((item) => item.name === selectedStyle)
+    ? selectedStyle
+    : null;
+  const linkedRecords = linkedStyle
+    ? analyticsRecords.filter((record) => danceCategory(record.course.style) === linkedStyle)
+    : analyticsRecords;
+  const linkedRatings = linkedStyle
+    ? linkedRecords
+      .map((record) => record.rating)
+      .filter((score): score is number => typeof score === "number")
+    : filteredRatings;
+  const linkedMonthStats = linkedStyle
+    ? monthStats.map((item) => {
+      const records = linkedRecords.filter((record) => record.date.startsWith(item.key));
+      const scores = records
+        .map((record) => record.rating)
+        .filter((score): score is number => typeof score === "number");
+      return {
+        ...item,
+        count: records.length,
+        averageRating: scores.length > 0
+          ? scores.reduce((sum, score) => sum + score, 0) / scores.length
+          : null,
+      };
+    })
+    : monthStats;
+  const linkedRecordCount = linkedStyle ? linkedRecords.length : checkinCount;
+  const ratingDistribution = RATING_GUIDE.map((item) => ({
+    ...item,
+    count: linkedRatings.filter((score) => score === item.score).length,
+  }));
+  const maxMonthCount = Math.max(1, ...linkedMonthStats.map((item) => item.count));
+  const maxRatingCount = Math.max(1, ...ratingDistribution.map((item) => item.count));
+  const linkedActiveMonths = linkedMonthStats.filter((item) => item.count > 0).length;
+  const linkedAverageRating = linkedRatings.length > 0
+    ? linkedRatings.reduce((sum, score) => sum + score, 0) / linkedRatings.length
+    : null;
+  const peakMonth = checkinCount > 0 && monthStats.length > 0
+    ? monthStats.reduce((best, item) => item.count > best.count ? item : best, monthStats[0])
+    : null;
   const currentUnitPrice = checkinCount > 0 ? ANNUAL_SPEND / checkinCount : null;
   const remainingCount = Math.max(TARGET_COUNT - checkinCount, 0);
   const progress = Math.min((checkinCount / TARGET_COUNT) * 100, 100);
+  const progressLabel = progress === 0 || progress >= 10 ? progress.toFixed(0) : progress.toFixed(1);
   const periodDays = inclusiveDays(startDate, endDate);
-  const weeklyTarget = TARGET_COUNT / (periodDays / 7);
   const dailyTarget = TARGET_COUNT / periodDays;
+  const weeklyTarget = dailyTarget * 7;
+  const monthlyTarget = MONTHLY_TARGET;
+  const todayKey = chinaDateKey();
+  const elapsedPassDays = todayKey < startDate
+    ? 0
+    : inclusiveDays(startDate, todayKey > endDate ? endDate : todayKey);
+  const remainingPassDays = Math.max(periodDays - elapsedPassDays, 0);
+  const averageMonthDays = 365.2425 / 12;
+  const elapsedPassMonths = elapsedPassDays / averageMonthDays;
+  const totalPassMonths = periodDays / averageMonthDays;
+  const timeProgress = Math.min((elapsedPassDays / periodDays) * 100, 100);
+  const currentMonthKey = todayKey.slice(0, 7);
+  const currentMonthPosition = linkedMonthStats.findIndex((item) => item.key === currentMonthKey);
+  const latestMonthPosition = currentMonthPosition >= 0
+    ? currentMonthPosition
+    : Math.max(0, linkedMonthStats.length - 1);
+  const monthWindowEndPosition = Math.min(
+    latestMonthPosition,
+    Math.max(0, latestMonthPosition + monthWindowOffset),
+  );
+  const visibleLinkedMonthStats = linkedMonthStats.slice(
+    Math.max(0, monthWindowEndPosition - 2),
+    monthWindowEndPosition + 1,
+  );
+  const displayedMonthStats = linkedMonthStats[monthWindowEndPosition] || null;
+  const canViewPreviousMonth = monthWindowEndPosition > 0;
+  const canViewNextMonth = monthWindowEndPosition < latestMonthPosition;
+  const currentMonthClasses = monthStats.find((item) => item.key === currentMonthKey)?.count || 0;
+  const monthlyGoalRate = monthlyTarget > 0
+    ? (currentMonthClasses / monthlyTarget) * 100
+    : 0;
+  const displayedMonthGoalRate = displayedMonthStats && monthlyTarget > 0
+    ? (displayedMonthStats.count / monthlyTarget) * 100
+    : 0;
 
   const viewYear = Math.floor(viewMonth / 12);
   const viewMonthZero = ((viewMonth % 12) + 12) % 12;
   const calendarCells = monthCells(viewYear, viewMonthZero);
   const minMonth = monthIndex(startDate);
   const maxMonth = monthIndex(endDate);
-  const todayKey = chinaDateKey();
   const weekCalendarCells = weekCells(selectedDate);
   const weekStartKey = dateKey(weekCalendarCells[0]);
   const weekEndKey = dateKey(weekCalendarCells[6]);
-  const periodYearLabel = startDate.slice(0, 4) === endDate.slice(0, 4)
-    ? startDate.slice(0, 4)
-    : `${startDate.slice(0, 4)}—${endDate.slice(0, 4)}`;
   const selectedDay = dateFromKey(selectedDate);
-  const selectedCourses = SCHEDULE[selectedDay.getDay()] || [];
+  const selectedCourses = coursesForDate(selectedDate);
   const selectedCourseSlots = groupCoursesByTime(selectedCourses);
   const selectedCompletedSlots = selectedCourseSlots.filter((slot) =>
     slot.courses.some((course) => effectiveCheckins.has(`${selectedDate}::${course.id}`)),
@@ -373,6 +639,66 @@ export function DanceCalendar() {
     }
   }
 
+  function exportBackup() {
+    const data: SavedState = {
+      startDate,
+      endDate,
+      checkins: Array.from(checkins),
+      ratings,
+    };
+    const backup: BackupFile = {
+      app: BACKUP_APP_ID,
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      data,
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `my-dance-diary-${chinaDateKey()}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setBackupNotice({ tone: "success", text: `已导出 ${checkins.size} 条打卡记录，请妥善保存文件。` });
+  }
+
+  async function importBackup(file: File | undefined) {
+    if (!file) return;
+    try {
+      if (file.size > 2 * 1024 * 1024) throw new Error("备份文件不能超过 2 MB。");
+      const restored = parseBackup(JSON.parse(await file.text()));
+      const shouldRestore = window.confirm(
+        `导入将覆盖当前浏览器中的 ${checkins.size} 条打卡记录，并恢复为备份中的 ${restored.checkins.length} 条。是否继续？`,
+      );
+      if (!shouldRestore) return;
+
+      const nextSelectedDate = clampDateKey(
+        shiftDateKey(chinaDateKey(), -1),
+        restored.startDate,
+        restored.endDate,
+      );
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(restored));
+      setStartDate(restored.startDate);
+      setEndDate(restored.endDate);
+      setCheckins(new Set(restored.checkins));
+      setRatings(restored.ratings || {});
+      setSelectedDate(nextSelectedDate);
+      setViewMonth(monthIndex(nextSelectedDate));
+      setSelectedStyle(null);
+      setRatingCourseId(null);
+      setBackupNotice({ tone: "success", text: `导入成功，已恢复 ${restored.checkins.length} 条打卡记录。` });
+    } catch (error) {
+      setBackupNotice({
+        tone: "error",
+        text: error instanceof Error ? error.message : "导入失败，请选择由本页面导出的 JSON 备份。",
+      });
+    } finally {
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  }
+
   function jumpToStart() {
     setSelectedDate(startDate);
     setViewMonth(monthIndex(startDate));
@@ -387,17 +713,28 @@ export function DanceCalendar() {
     <main className="site-shell" data-theme="y2k">
       <header className="topbar">
         <a className="brand" href="#top" aria-label="回到顶部">
-          <span className="brand-mark">D</span>
+          <span className="brand-mark">M</span>
           <span>
-            <b>DANCE DIARY</b>
+            <b>MY DANCE DIARY</b>
             <small>DANCE DIARY</small>
           </span>
         </a>
         <div className="topbar-meta">
-          <span className="era-label">{periodYearLabel} · DANCE DIARY</span>
-          <button className="text-button" type="button" onClick={() => setShowSettings((value) => !value)}>
-            {showSettings ? "收起设置" : "年卡设置"}
-          </button>
+          <span className="era-label">{startDate.slice(0, 4)}—{endDate.slice(0, 4)} · DANCE DIARY</span>
+          <div className="topbar-actions">
+            <button className="text-button" type="button" onClick={() => {
+              setShowBackup((value) => !value);
+              setShowSettings(false);
+            }}>
+              {showBackup ? "收起备份" : "数据备份"}
+            </button>
+            <button className="text-button" type="button" onClick={() => {
+              setShowSettings((value) => !value);
+              setShowBackup(false);
+            }}>
+              {showSettings ? "收起设置" : "年卡设置"}
+            </button>
+          </div>
         </div>
       </header>
 
@@ -408,7 +745,7 @@ export function DanceCalendar() {
             <span>Y2K DIARY EDITION</span>
           </div>
           <h1>
-            <small>DANCE PRACTICE · {periodYearLabel}</small>
+            <small>VIBE CODING · DANCE DIARY</small>
             MY DANCE
             <span>DIARY</span>
           </h1>
@@ -425,7 +762,7 @@ export function DanceCalendar() {
 
         <div className="archive-visual" aria-hidden="true">
           <div className="archive-card archive-card-main">
-            <span className="paper-tape">YOUR COPY</span>
+            <span className="paper-tape">MY COPY</span>
             <p>CHECK-INS SAVED</p>
             <strong>{String(checkinCount).padStart(3, "0")}</strong>
             <small>EVERY CLASS BECOMES A PAGE.</small>
@@ -435,11 +772,11 @@ export function DanceCalendar() {
           </div>
           <div className="archive-ticket">
             <span>ANNUAL PRACTICE PASS</span>
-            <b>{periodYearLabel}</b>
-            <small>DANCE DIARY · ADMIT ONE</small>
+            <b>{startDate.slice(0, 4)} — {endDate.slice(0, 4)}</b>
+            <small>MY DANCE DIARY · ADMIT ONE</small>
           </div>
           <div className="archive-disc">
-            <span>DD</span>
+            <span>MD</span>
             <small>PLAY<br />REWIND<br />GROW</small>
           </div>
           <span className="archive-star star-one">✦</span>
@@ -454,8 +791,8 @@ export function DanceCalendar() {
             aria-label={`目标进度 ${progress.toFixed(1)}%`}
           >
             <div>
-              <strong>{checkinCount}</strong>
-              <span>/ {TARGET_COUNT} 节</span>
+              <strong>{progressLabel}%</strong>
+              <span>目标完成率</span>
             </div>
           </div>
           <div className="goal-copy">
@@ -475,7 +812,7 @@ export function DanceCalendar() {
           <div>
             <p className="section-kicker">DIARY PERIOD</p>
             <h2>调整年卡有效期</h2>
-            <p>示例周期为 {DEFAULT_START} 至 {DEFAULT_END}；年度练舞目标为 {TARGET_COUNT} 节，单节课价会随累计打卡次数自动更新。</p>
+            <p>默认记录周期为 {DEFAULT_START.replaceAll("-", ".")} 至 {DEFAULT_END.replaceAll("-", ".")}；每月目标 {MONTHLY_TARGET} 节、年度练舞目标 {TARGET_COUNT} 节，单节课价会随累计打卡次数自动更新。</p>
           </div>
           <div className="date-fields">
             <label>
@@ -494,6 +831,41 @@ export function DanceCalendar() {
                 onChange={(event) => applyDates(startDate, event.target.value)}
               />
             </label>
+          </div>
+        </section>
+      )}
+
+      {showBackup && (
+        <section className="settings-panel backup-panel" aria-label="数据备份">
+          <div>
+            <p className="section-kicker">DATA BACKUP</p>
+            <h2>带走你的练舞日记</h2>
+            <p>导出会保存有效期、打卡和评分；导入会覆盖当前浏览器中的记录，课表不会改变。</p>
+          </div>
+          <div className="backup-controls">
+            <div className="backup-actions">
+              <button type="button" className="backup-button primary" onClick={exportBackup} disabled={!loaded}>
+                <span>导出数据</span>
+                <small>下载 JSON 备份</small>
+              </button>
+              <button type="button" className="backup-button" onClick={() => importInputRef.current?.click()} disabled={!loaded}>
+                <span>导入数据</span>
+                <small>恢复已有备份</small>
+              </button>
+              <input
+                ref={importInputRef}
+                className="backup-file-input"
+                type="file"
+                accept=".json,application/json"
+                aria-label="选择练舞日记备份文件"
+                onChange={(event) => void importBackup(event.target.files?.[0])}
+              />
+            </div>
+            {backupNotice && (
+              <p className={`backup-notice ${backupNotice.tone}`} role={backupNotice.tone === "error" ? "alert" : "status"}>
+                {backupNotice.text}
+              </p>
+            )}
           </div>
         </section>
       )}
@@ -614,7 +986,7 @@ export function DanceCalendar() {
                 const key = dateKey(date);
                 const inMonth = date.getMonth() === viewMonthZero;
                 const active = key >= startDate && key <= endDate;
-                const courses = SCHEDULE[date.getDay()] || [];
+                const courses = coursesForDate(key);
                 const courseSlots = groupCoursesByTime(courses);
                 const courseLevels = DIFFICULTY_ORDER.filter((level) =>
                   courses.some((course) => course.level === level),
@@ -711,7 +1083,7 @@ export function DanceCalendar() {
                   {weekCalendarCells.map((date) => {
                     const key = dateKey(date);
                     const active = key >= startDate && key <= endDate;
-                    const courses = SCHEDULE[date.getDay()] || [];
+                    const courses = coursesForDate(key);
                     const courseSlots = groupCoursesByTime(courses);
                     const completedSlots = courseSlots.filter((slot) =>
                       slot.courses.some((course) => effectiveCheckins.has(`${key}::${course.id}`)),
@@ -949,6 +1321,124 @@ export function DanceCalendar() {
         </div>
       </section>
 
+      <section className="analytics-section" aria-label="练舞数据看板">
+        <div className="section-heading">
+          <div>
+            <p className="section-kicker">DANCE DATA · PRACTICE PORTRAIT</p>
+            <h2>我的练舞数据看板</h2>
+          </div>
+          <p>按舞种看偏好 · 按月份看节奏 · 用目标达成率校准练习进度</p>
+        </div>
+
+        <article className="dance-mix-card">
+          <header className="dance-mix-header">
+            <span>
+              <small>DANCE MIX · SIDE A</small>
+              <strong>舞种练习歌单</strong>
+            </span>
+            <p>{linkedStyle ? `${linkedStyle} 正在播放` : "点击舞种，联动查看评分与月度节奏"}</p>
+          </header>
+
+          {styleStats.length > 0 ? (
+            <div className="dance-mix-board">
+              <div className={`dance-mix-list ${linkedStyle ? "has-selection" : ""}`}>
+                {styleStats.map((item, index) => (
+                  <button
+                    type="button"
+                    className={`dance-mix-row ${linkedStyle === item.name ? "selected" : ""}`}
+                    key={item.name}
+                    onClick={() => setSelectedStyle((current) => current === item.name ? null : item.name)}
+                    aria-pressed={linkedStyle === item.name}
+                    aria-label={`${item.name}，${item.count}节，平均评分${item.averageRating?.toFixed(1) || "暂无"}，平均舞力${item.averagePower?.toFixed(1) || "暂无"}`}
+                  >
+                    <span className="dance-mix-rank">{String(index + 1).padStart(2, "0")}</span>
+                    <span className="dance-mix-name"><strong>{item.name}</strong><small>STYLE TRACK</small></span>
+                    <span className="dance-mix-metric"><small>均分</small><strong>{item.averageRating === null ? "—" : `S${item.averageRating.toFixed(1)}`}</strong></span>
+                    <span className="dance-mix-metric"><small>课次</small><strong>{item.count}<em>节</em></strong></span>
+                    <span className="dance-mix-metric"><small>舞力</small><strong>{item.averagePower === null ? "—" : item.averagePower.toFixed(1)}</strong></span>
+                    <span className="dance-mix-meter" aria-hidden="true"><i style={{ width: `${((item.averageRating || 0) / 5) * 100}%` }} /></span>
+                    <span className="dance-mix-arrow" aria-hidden="true">↗</span>
+                  </button>
+                ))}
+              </div>
+
+              <div className="dance-mix-detail">
+                <header className="dance-mix-detail-header">
+                  <span><small>NOW PLAYING</small><strong>{linkedStyle || "全部舞种"}</strong></span>
+                  {linkedStyle ? (
+                    <button className="chart-filter-reset" type="button" onClick={() => setSelectedStyle(null)}>返回全部 ×</button>
+                  ) : (
+                    <i>{linkedRecordCount} 节已收录</i>
+                  )}
+                </header>
+
+                <div className="dance-mix-insights">
+                  <section className="mix-rating-panel" aria-label={`${linkedStyle || "全部舞种"}评分分布`}>
+                    <header><strong>评分状态</strong><small>{linkedRatings.length} REVIEWS</small></header>
+                    <div className="mix-rating-list">
+                      {ratingDistribution.map((item) => (
+                        <div className="mix-rating-row" key={item.score}>
+                          <span><b>S{item.score}</b><small>{item.label}</small></span>
+                          <span className="mix-rating-track" aria-hidden="true"><i style={{ width: `${(item.count / maxRatingCount) * 100}%` }} /></span>
+                          <strong>{item.count}</strong>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+
+                  <section className="mix-month-panel" aria-label={`${linkedStyle || "全部舞种"}月度节奏`}>
+                    <header>
+                      <span><strong>近月节奏</strong><small>{linkedActiveMonths} ACTIVE MONTHS</small></span>
+                      <div className="mix-month-header-tools">
+                        <i>{peakMonth ? `最勤 ${peakMonth.year}.${peakMonth.label.replace("月", "")}` : "等待记录"}</i>
+                        <div className="mix-month-nav" aria-label="切换月度节奏">
+                          <button
+                            type="button"
+                            aria-label="查看上个月"
+                            disabled={!canViewPreviousMonth}
+                            onClick={() => setMonthWindowOffset((offset) => offset - 1)}
+                          >
+                            ←
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="查看下个月"
+                            disabled={!canViewNextMonth}
+                            onClick={() => setMonthWindowOffset((offset) => Math.min(0, offset + 1))}
+                          >
+                            →
+                          </button>
+                        </div>
+                      </div>
+                    </header>
+                    <div className="mix-month-content">
+                      <div className="mix-month-bars">
+                        {visibleLinkedMonthStats.map((item) => (
+                          <div className={`mix-month-column ${item.key === currentMonthKey ? "current" : ""} ${item.key === displayedMonthStats?.key ? "selected" : ""}`} key={item.key}>
+                            <small>{item.year}.{item.label.replace("月", "")}</small>
+                            <span className="mix-month-plot">
+                              <i style={{ height: `${(item.count / maxMonthCount) * 100}%` }}><b>{item.count}</b></i>
+                            </span>
+                            <strong>{item.averageRating === null ? "S—" : `S${item.averageRating.toFixed(1)}`}</strong>
+                          </div>
+                        ))}
+                      </div>
+                      <aside className="mix-month-summary">
+                        <small>{linkedStyle ? "STYLE TOTAL" : monthWindowOffset === 0 ? "本月达成" : `${displayedMonthStats?.year}.${displayedMonthStats?.label.replace("月", "")} 达成`}</small>
+                        <strong>{linkedStyle ? linkedRecords.length : displayedMonthGoalRate.toFixed(0)}<em>{linkedStyle ? "节" : "%"}</em></strong>
+                        <span>{linkedStyle ? `平均评分 ${linkedAverageRating === null ? "—" : `S${linkedAverageRating.toFixed(1)}`}` : `${displayedMonthStats?.count || 0} / ${monthlyTarget} 节`}</span>
+                      </aside>
+                    </div>
+                  </section>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <p className="chart-empty">完成第一次评分打卡后，这里会生成你的舞种练习歌单。</p>
+          )}
+        </article>
+      </section>
+
       <section className="value-ledger" aria-label="练舞节奏记录">
         <div>
           <p className="section-kicker">PRACTICE PULSE</p>
@@ -965,17 +1455,38 @@ export function DanceCalendar() {
             <strong>{checkinCount} 节</strong>
           </span>
           <span>
+            <small>已使用卡期</small>
+            <strong>{elapsedPassMonths.toFixed(1)} 个月</strong>
+          </span>
+          <span>
             <small>年度目标</small>
             <strong>{TARGET_COUNT} 节</strong>
           </span>
         </div>
-        <div className="ledger-progress">
-          <span style={{ width: `${progress}%` }} />
+        <div className="ledger-progress-group">
+          <div className="ledger-progress-item">
+            <div className="ledger-progress-label">
+              <span>课次进度</span>
+              <b>{checkinCount} / {TARGET_COUNT} 节 · {progress.toFixed(0)}%</b>
+            </div>
+            <div className="ledger-progress">
+              <span style={{ width: `${progress}%` }} />
+            </div>
+          </div>
+          <div className="ledger-progress-item">
+            <div className="ledger-progress-label">
+              <span>时间进度</span>
+              <b>已用 {elapsedPassDays} / {periodDays} 天 · 剩余 {remainingPassDays} 天 · {timeProgress.toFixed(0)}%</b>
+            </div>
+            <div className="ledger-progress time-progress">
+              <span style={{ width: `${timeProgress}%` }} />
+            </div>
+          </div>
         </div>
         <p className="ledger-formula">
           {currentUnitPrice === null
-            ? "完成第一次打卡后，这里会显示你的实时单节课价"
-            : `已记录 ${checkinCount} 节 · 当前单节课价 ¥${currentUnitPrice.toFixed(2)}`}
+            ? `卡期已使用 ${elapsedPassMonths.toFixed(1)} / ${totalPassMonths.toFixed(1)} 个月 · 完成第一次打卡后显示实时单节课价`
+            : `卡期已使用 ${elapsedPassMonths.toFixed(1)} / ${totalPassMonths.toFixed(1)} 个月 · 已记录 ${checkinCount} 节 · 当前单节课价 ¥${currentUnitPrice.toFixed(2)}`}
         </p>
       </section>
 
@@ -991,9 +1502,9 @@ export function DanceCalendar() {
         <div className="milestone-track archive-track">
           {[
             { count: 1, label: "第一张记录" },
-            { count: 30, label: "稳定出现" },
-            { count: 60, label: "动作成章" },
-            { count: 90, label: "舞台在场" },
+            { count: Math.max(2, Math.round(TARGET_COUNT * 0.25)), label: "稳定出现" },
+            { count: Math.max(3, Math.round(TARGET_COUNT * 0.5)), label: "动作成章" },
+            { count: Math.max(4, Math.round(TARGET_COUNT * 0.75)), label: "舞台在场" },
             { count: TARGET_COUNT, label: "年度目标完成" },
           ].map((milestone) => {
             const reached = checkinCount >= milestone.count;
@@ -1009,10 +1520,10 @@ export function DanceCalendar() {
       </section>
 
       <footer>
-        <div className="footer-monogram">D</div>
+        <div className="footer-seven">P</div>
         <div>
           <strong>MY DANCE DIARY · 把喜欢的事写进一整年的日记。</strong>
-          <p>当前使用匿名示例课表；请在 app/dance-config.ts 中替换为自己的课程。</p>
+          <p>课程依据你提供的日常班课表录入；节假日、调课与临时停课请以舞室通知为准。</p>
         </div>
       </footer>
     </main>

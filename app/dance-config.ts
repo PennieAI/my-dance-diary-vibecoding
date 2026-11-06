@@ -11,7 +11,9 @@ export type Course = {
 // Demo values only. Replace them with your own membership and practice goal.
 export const ANNUAL_SPEND = 3600;
 export const TARGET_COUNT = 120;
+export const MONTHLY_TARGET = 10;
 export const STORAGE_KEY = "my-dance-diary-demo-v1";
+export const BACKUP_APP_ID = "my-dance-diary";
 export const DEFAULT_START = "2026-01-01";
 export const DEFAULT_END = "2026-12-31";
 
